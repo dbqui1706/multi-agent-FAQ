@@ -1,14 +1,20 @@
 """
-pipeline.py — Sequential Multi-Agent FAQ Pipeline Orchestrator
-==============================================================
-Stages (run in order):
-  1. Chunker      → Split PDF into Chương/Điều chunks
-  2. Extractor    → Extract key info from each chunk (Gemini)
-  3. FAQ Generator→ Generate Q&A pairs with context (Gemini)
-  4. Reviewer     → Score & filter Q&A pairs (Gemini)
-  5. Output       → Save to JSON + Markdown
+pipeline.py — Sequential Multi-Agent FAQ Pipeline — FIXED VERSION
+==================================================================
+Fix so với bản gốc:
+  [FIX-1] Step 1 và 2 được bật lại đúng cách, không còn load file cũ
+  [FIX-2] Bổ sung STEP 4.5: Deduplication (loại câu hỏi quá giống nhau)
+  [FIX-3] _save_markdown() hiển thị review_breakdown + improvement_hint
+  [FIX-4] Pipeline có thể resume từ bất kỳ step nào qua biến RESUME_FROM_STEP
+  [IMP-1] Stats cuối pipeline chi tiết hơn (rejection reasons, persona dist)
 
-Intermediate outputs are saved to output/step_*.json for easy debugging.
+Stages:
+  1. Chunker       → Split PDF thành Chương/Điều chunks
+  2. Extractor     → Extract key info có cấu trúc (JSON) từ mỗi chunk
+  3. FAQ Generator → Sinh Q&A với context independence + diversity control
+  4. Reviewer      → Chấm 5 tiêu chí, reject context-dependent questions
+  4.5. Dedup       → Loại câu hỏi trùng lặp (cosine similarity > 0.85)
+  5. Output        → Lưu JSON + Markdown
 """
 
 import json
@@ -22,20 +28,29 @@ from pathlib import Path
 from dotenv import load_dotenv
 from google import genai
 
-# ── Paths ───────────────────────────────────────────────────────────────────
-BASE_DIR = Path(__file__).parent
-PDF_PATH = BASE_DIR / "data" / "QUY CHẾ ĐÀO TẠO TRÌNH ĐỘ THẠC SĨ.pdf"
+# ── Paths ─────────────────────────────────────────────────────────────────────
+BASE_DIR   = Path(__file__).parent
+PDF_PATH   = BASE_DIR / "data" / "QUY CHẾ ĐÀO TẠO TRÌNH ĐỘ THẠC SĨ.pdf"
 OUTPUT_DIR = BASE_DIR / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-# ── Env & Config ──────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
 load_dotenv()
-API_KEY = os.getenv("GEMINI_API_KEY", "")
+API_KEY    = os.getenv("GEMINI_API_KEY", "")
 MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-# ── Logging setup ─────────────────────────────────────────────────────────────
+# [FIX-4] Resume control: đặt số step muốn bắt đầu lại (1 = chạy từ đầu)
+# Ví dụ: RESUME_FROM_STEP=3 → load step_2_extracted.json, chạy từ step 3
+RESUME_FROM_STEP = int(os.getenv("RESUME_FROM_STEP", "1"))
+
+# Dedup similarity threshold — cặp câu hỏi có similarity > threshold sẽ bị loại
+DEDUP_THRESHOLD = float(os.getenv("DEDUP_THRESHOLD", "0.85"))
+
+# ── Logging ───────────────────────────────────────────────────────────────────
 import io
-_utf8_stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True)
+_utf8_stdout = io.TextIOWrapper(
+    sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True
+)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -48,143 +63,273 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Utility
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _save_json(data, filename: str) -> None:
     path = OUTPUT_DIR / filename
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
-    logger.info("Saved: %s  (%d items)", path.name, len(data) if isinstance(data, list) else 1)
+    n = len(data) if isinstance(data, list) else 1
+    logger.info("Saved: %s  (%d items)", path.name, n)
 
 
-def _banner(step: int, name: str) -> None:
-    sep = "─" * 60
-    logger.info("\n%s\n  STEP %d — %s\n%s", sep, step, name, sep)
+def _load_json(filename: str):
+    path = OUTPUT_DIR / filename
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
 
+
+def _banner(step, name: str) -> None:
+    sep = "─" * 62
+    logger.info("\n%s\n  STEP %s — %s\n%s", sep, step, name, sep)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Deduplication (Step 4.5)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _dedup_faqs(
+    faqs: list[dict],
+    threshold: float = 0.85,
+) -> list[dict]:
+    """
+    [FIX-2] Loại bỏ câu hỏi quá giống nhau dựa trên TF-IDF cosine similarity.
+    Giữ lại câu hỏi đầu tiên khi 2 câu hỏi similarity > threshold.
+
+    Returns:
+        Danh sách FAQ đã dedup.
+    """
+    if len(faqs) < 2:
+        return faqs
+
+    try:
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.metrics.pairwise import cosine_similarity
+        import numpy as np
+    except ImportError:
+        logger.warning("[Dedup] sklearn not available, skipping deduplication.")
+        return faqs
+
+    questions = [f["question"] for f in faqs]
+    vec       = TfidfVectorizer(
+        analyzer="char_wb", ngram_range=(2, 4), sublinear_tf=True
+    ).fit_transform(questions)
+    sim_matrix = cosine_similarity(vec)
+
+    n         = len(faqs)
+    to_remove = set()
+
+    for i in range(n):
+        if i in to_remove:
+            continue
+        for j in range(i + 1, n):
+            if j in to_remove:
+                continue
+            if sim_matrix[i, j] > threshold:
+                # Giữ câu hỏi có review_score cao hơn
+                score_i = faqs[i].get("review_score", 0)
+                score_j = faqs[j].get("review_score", 0)
+                remove_idx = j if score_i >= score_j else i
+                to_remove.add(remove_idx)
+                logger.debug(
+                    "[Dedup] Removing duplicate (sim=%.3f): %s",
+                    sim_matrix[i, j],
+                    faqs[remove_idx]["question"][:60],
+                )
+
+    deduped = [f for idx, f in enumerate(faqs) if idx not in to_remove]
+    logger.info(
+        "[Dedup] %d → %d FAQs (removed %d duplicates, threshold=%.2f)",
+        n, len(deduped), len(to_remove), threshold,
+    )
+    return deduped
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main pipeline
+# ─────────────────────────────────────────────────────────────────────────────
 
 def run_pipeline() -> None:
-    # ── Validate config ──────────────────────────────────────────────────────
     if not API_KEY or API_KEY == "your_gemini_api_key_here":
-        logger.error(
-            "GEMINI_API_KEY chưa được thiết lập!\n"
-            "Mở file .env và thêm API key của bạn vào."
-        )
+        logger.error("GEMINI_API_KEY chưa được thiết lập trong file .env!")
         sys.exit(1)
 
     if not PDF_PATH.exists():
         logger.error("Không tìm thấy file PDF: %s", PDF_PATH)
         sys.exit(1)
 
-    # Initialize new google.genai client
-    client = genai.Client(api_key=API_KEY)
-
+    client         = genai.Client(api_key=API_KEY)
     pipeline_start = time.time()
-    logger.info("=" * 60)
-    logger.info("  SEQUENTIAL MULTI-AGENT FAQ PIPELINE")
-    logger.info("  PDF: %s", PDF_PATH.name)
-    logger.info("  Model: %s", MODEL_NAME)
-    logger.info("  Bắt đầu: %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-    logger.info("=" * 60)
 
-    # ── STEP 1: CHUNKER ──────────────────────────────────────────────────────
+    logger.info("=" * 62)
+    logger.info("  SEQUENTIAL MULTI-AGENT FAQ PIPELINE (FIXED)")
+    logger.info("  PDF:    %s", PDF_PATH.name)
+    logger.info("  Model:  %s", MODEL_NAME)
+    logger.info("  Resume: step %d", RESUME_FROM_STEP)
+    logger.info("  Start:  %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    logger.info("=" * 62)
+
+    # ── STEP 1: CHUNKER ───────────────────────────────────────────────────────
     _banner(1, "CHUNKER — Phân tích cấu trúc PDF")
-    # from agents import agent_chunker
-    # chunks = agent_chunker.run(str(PDF_PATH))
-    # _save_json(chunks, "step_1_chunks.json")
-    # logger.info("✓ Chunker: %d chunks tạo thành công", len(chunks))
-    # Load file chunker json
-    # with open(OUTPUT_DIR / "step_1_chunks.json", "r", encoding="utf-8") as f:
-    #     chunks = json.load(f)
+    if RESUME_FROM_STEP <= 1:
+        from agents import agent_chunker
+        chunks = agent_chunker.run(str(PDF_PATH))
+        _save_json(chunks, "step_1_chunks.json")
+        logger.info("✓ Chunker: %d chunks", len(chunks))
+    else:
+        chunks = _load_json("step_1_chunks.json")
+        logger.info("↩ Loaded step_1_chunks.json (%d chunks)", len(chunks))
 
-    # ── STEP 2: EXTRACTOR ────────────────────────────────────────────────────
-    _banner(2, "EXTRACTOR — Trich xuat thong tin quan trong")
-    # from agents import agent_extractor
-    # enriched_chunks = agent_extractor.run(chunks, client, MODEL_NAME)
-    # _save_json(enriched_chunks, "step_2_extracted.json")
-    # logger.info("Extractor: %d chunks da duoc lam giau", len(enriched_chunks))
-    with open(OUTPUT_DIR / "step_2_extracted.json", "r", encoding="utf-8") as f:
-        enriched_chunks = json.load(f)
+    # ── STEP 2: EXTRACTOR ─────────────────────────────────────────────────────
+    _banner(2, "EXTRACTOR — Trích xuất thông tin có cấu trúc")
+    if RESUME_FROM_STEP <= 2:
+        from agents import agent_extractor
+        enriched_chunks = agent_extractor.run(chunks, client, MODEL_NAME)
+        _save_json(enriched_chunks, "step_2_extracted.json")
+        logger.info("✓ Extractor: %d chunks enriched", len(enriched_chunks))
+    else:
+        enriched_chunks = _load_json("step_2_extracted.json")
+        logger.info("↩ Loaded step_2_extracted.json (%d chunks)", len(enriched_chunks))
 
-    # ── STEP 3: FAQ GENERATOR ────────────────────────────────────────────────
-    _banner(3, "FAQ GENERATOR — Tao Q&A voi context")
-    from agents import agent_faq_generator
-    raw_faqs = agent_faq_generator.run(enriched_chunks, client, MODEL_NAME)
-    _save_json(raw_faqs, "step_3_faqs.json")
-    logger.info("FAQ Generator: %d Q&A pairs da tao", len(raw_faqs))
-    with open(OUTPUT_DIR / "step_3_faqs.json", "r", encoding="utf-8") as f:
-        raw_faqs = json.load(f)
+    # ── STEP 3: FAQ GENERATOR ─────────────────────────────────────────────────
+    _banner(3, "FAQ GENERATOR — Sinh Q&A với diversity control")
+    if RESUME_FROM_STEP <= 3:
+        from agents import agent_faq_generator
+        raw_faqs = agent_faq_generator.run(enriched_chunks, client, MODEL_NAME)
+        _save_json(raw_faqs, "step_3_faqs.json")
+        logger.info("✓ FAQ Generator: %d Q&A pairs", len(raw_faqs))
+    else:
+        raw_faqs = _load_json("step_3_faqs.json")
+        logger.info("↩ Loaded step_3_faqs.json (%d items)", len(raw_faqs))
 
-    # # ── STEP 4: REVIEWER ─────────────────────────────────────────────────────
-    _banner(4, "REVIEWER — Kiem tra chat luong Q&A")
-    from agents import agent_reviewer
-    approved_faqs = agent_reviewer.run(raw_faqs, client, MODEL_NAME)
-    _save_json(approved_faqs, "step_4_reviewed.json")
-    logger.info(
-        "Reviewer: %d/%d Q&A duoc duyet (%.0f%%)",
-        len(approved_faqs),
-        len(raw_faqs),
-        (len(approved_faqs) / len(raw_faqs) * 100) if raw_faqs else 0,
+    # ── STEP 4: REVIEWER ──────────────────────────────────────────────────────
+    _banner(4, "REVIEWER — Chấm 5 tiêu chí, reject context-dependent")
+    if RESUME_FROM_STEP <= 4:
+        from agents import agent_reviewer
+        reviewed_faqs = agent_reviewer.run(raw_faqs, client, MODEL_NAME)
+        _save_json(reviewed_faqs, "step_4_reviewed.json")
+        logger.info(
+            "✓ Reviewer: %d/%d approved (%.0f%%)",
+            len(reviewed_faqs), len(raw_faqs),
+            (len(reviewed_faqs) / len(raw_faqs) * 100) if raw_faqs else 0,
+        )
+    else:
+        reviewed_faqs = _load_json("step_4_reviewed.json")
+        logger.info("↩ Loaded step_4_reviewed.json (%d items)", len(reviewed_faqs))
+
+    # ── STEP 4.5: DEDUPLICATION ───────────────────────────────────────────────
+    _banner("4.5", "DEDUPLICATION — Loại câu hỏi trùng lặp")
+    deduped_faqs = _dedup_faqs(reviewed_faqs, threshold=DEDUP_THRESHOLD)
+    _save_json(deduped_faqs, "step_45_deduped.json")
+
+    # ── STEP 5: OUTPUT ────────────────────────────────────────────────────────
+    _banner(5, "OUTPUT — Xuất kết quả cuối")
+    final_faqs = deduped_faqs
+    _save_json(final_faqs, "faq_final.json")
+    _save_markdown(final_faqs)
+
+    elapsed = time.time() - pipeline_start
+    _print_final_stats(final_faqs, raw_faqs, elapsed)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Output formatters
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _print_final_stats(
+    final_faqs: list[dict],
+    raw_faqs: list[dict],
+    elapsed: float,
+) -> None:
+    """[IMP-1] Thống kê cuối pipeline chi tiết."""
+    from collections import Counter
+
+    persona_dist = Counter(f.get("persona", "unknown") for f in final_faqs)
+    score_avg    = (
+        sum(f.get("review_score", 0) for f in final_faqs) / len(final_faqs)
+        if final_faqs else 0
     )
 
-    # # ── STEP 5: OUTPUT ───────────────────────────────────────────────────────
-    # _banner(5, "OUTPUT — Xuat ket qua cuoi")
-    _save_json(approved_faqs, "faq_final.json")
-    _save_markdown(approved_faqs)
-
-    #
-    elapsed = time.time() - pipeline_start
-    logger.info("\n%s", "=" * 60)
-    logger.info("  HOAN THANH! Thoi gian: %.1f giay", elapsed)
-    logger.info("  Output files trong thu muc: output/")
-    logger.info("    faq_final.json             - FAQ output (JSON)")
-    logger.info("    faq_final.md               - FAQ output (Markdown)")
-    logger.info("%s\n", "=" * 60)
+    logger.info("\n%s", "=" * 62)
+    logger.info("  PIPELINE HOÀN THÀNH")
+    logger.info("  Thời gian:    %.1f giây", elapsed)
+    logger.info("  Q&A raw:      %d", len(raw_faqs))
+    logger.info("  Q&A final:    %d (sau review + dedup)", len(final_faqs))
+    logger.info("  Review score avg: %.2f/10", score_avg)
+    logger.info("  Persona distribution: %s", dict(persona_dist))
+    logger.info("  Output files:")
+    logger.info("    faq_final.json      — FAQ cuối (JSON)")
+    logger.info("    faq_final.md        — FAQ cuối (Markdown)")
+    logger.info("    step_45_deduped.json — Sau dedup")
+    logger.info("    step_4_reviewed.json — Sau review")
+    logger.info("%s\n", "=" * 62)
 
 
 def _save_markdown(faqs: list[dict]) -> None:
-    """Format and save approved FAQs as a readable Markdown file."""
-    path = OUTPUT_DIR / "faq_final.md"
+    """
+    [FIX-3] Format markdown với đầy đủ review_breakdown và improvement_hint.
+    """
+    path  = OUTPUT_DIR / "faq_final.md"
     lines = [
         "# FAQ — Quy Chế Đào Tạo Trình Độ Thạc Sĩ",
         "",
-        f"> Tạo tự động bởi Sequential Multi-Agent Pipeline  ",
-        f"> Ngày tạo: {datetime.now().strftime('%d/%m/%Y %H:%M')}  ",
-        f"> Tổng số Q&A: **{len(faqs)}**",
+        f"> 🤖 Tạo tự động bởi Sequential Multi-Agent Pipeline  ",
+        f"> 📅 Ngày tạo: {datetime.now().strftime('%d/%m/%Y %H:%M')}  ",
+        f"> 📊 Tổng số Q&A: **{len(faqs)}**",
         "",
         "---",
         "",
     ]
 
-    # Group by source
     from collections import defaultdict
     grouped: dict[str, list[dict]] = defaultdict(list)
     for faq in faqs:
         grouped[faq.get("source", "Khác")].append(faq)
 
+    PERSONA_EMOJI = {
+        "student": "🎓",
+        "lecturer": "👨‍🏫",
+        "admin": "🏫",
+    }
+
     for source, items in grouped.items():
         lines.append(f"## {source}")
         lines.append("")
         for faq in items:
-            lines.append(f"### ❓ {faq['question']}")
+            persona_label = PERSONA_EMOJI.get(faq.get("persona", ""), "")
+            lines.append(f"### {persona_label} ❓ {faq['question']}")
             lines.append("")
             lines.append(f"**Trả lời:** {faq['answer']}")
             lines.append("")
 
-            # Context block
             ctx = faq.get("context", "").strip()
             if ctx:
-                lines.append("> **📄 Context (đoạn văn gốc liên quan):**")
+                lines.append("> **📄 Context (nguyên văn tài liệu):**")
                 for ctx_line in ctx.split("\n"):
                     lines.append(f"> {ctx_line}")
             lines.append("")
 
-            # Review metadata
-            score = faq.get("review_score", "-")
-            notes = faq.get("review_notes", "")
-            pages = faq.get("page_numbers", [])
-            meta_parts = [f"⭐ Review score: **{score}/10**"]
+            # [FIX-3] Hiển thị review breakdown đầy đủ
+            breakdown = faq.get("review_breakdown", {})
+            score     = faq.get("review_score", "-")
+            notes     = faq.get("review_notes", "")
+            hint      = faq.get("improvement_hint", "")
+            pages     = faq.get("page_numbers", [])
+
+            meta_parts = [f"⭐ Score: **{score}/10**"]
+            if breakdown:
+                bd_str = " | ".join(
+                    f"{k}: {v}"
+                    for k, v in breakdown.items()
+                )
+                meta_parts.append(f"📋 [{bd_str}]")
             if notes:
                 meta_parts.append(f"📝 {notes}")
             if pages:
                 meta_parts.append(f"📖 Trang: {', '.join(str(p) for p in pages)}")
+
             lines.append(f"<sub>{' &nbsp;|&nbsp; '.join(meta_parts)}</sub>")
             lines.append("")
             lines.append("---")
@@ -192,135 +337,7 @@ def _save_markdown(faqs: list[dict]) -> None:
 
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
-
     logger.info("Saved: %s  (%d items)", path.name, len(faqs))
-
-
-def _save_evaluation_markdown(report: dict) -> None:
-    """Render the evaluation report as a human-readable Markdown file."""
-    path = OUTPUT_DIR / "evaluation_report.md"
-    summary = report.get("summary", {})
-    coverage = report.get("coverage_detail", {})
-    items = report.get("per_item", [])
-
-    def _bar(score: float, max_val: float = 1.0, width: int = 20) -> str:
-        """Simple ASCII progress bar."""
-        ratio = min(score / max_val, 1.0)
-        filled = round(ratio * width)
-        return "█" * filled + "░" * (width - filled) + f"  {score:.3f}"
-
-    lines = [
-        "# Evaluation Report — FAQ Quy Chế Đào Tạo Trình Độ Thạc Sĩ",
-        "",
-        f"> Ngày đánh giá: {datetime.now().strftime('%d/%m/%Y %H:%M')}  ",
-        f"> Tổng số Q&A được đánh giá: **{summary.get('total_faq_items', len(items))}**  ",
-        f"> Phương pháp: LLM-as-a-Judge (Gemini) + Statistical",
-        "",
-        "---",
-        "",
-        "## 📊 Overall Scorecard",
-        "",
-        "| Metric | Score | Scale | Bar |",
-        "|--------|-------|-------|-----|",
-        f"| **Faithfulness Score** | `{summary.get('faithfulness_score', 0):.3f}` | [0, 1] | {_bar(summary.get('faithfulness_score', 0))} |",
-        f"| **Answer Relevance** | `{summary.get('answer_relevance_avg', 0):.2f}` | [1, 5] | {_bar(summary.get('answer_relevance_avg', 0), max_val=5)} |",
-        f"| **Context Independence Rate** | `{summary.get('context_independence_rate', 0):.1%}` | {{0,1}} | {_bar(summary.get('context_independence_rate', 0))} |",
-        f"| **Diversity Score** | `{summary.get('diversity_score', 0):.3f}` | [0, 1] | {_bar(summary.get('diversity_score', 0))} |",
-        f"| **Context Coverage / Recall** | `{summary.get('context_coverage', 0):.3f}` | [0, 1] | {_bar(summary.get('context_coverage', 0))} |",
-        f"| **Retrieval Effectiveness** | `{summary.get('retrieval_effectiveness_avg', 0):.3f}` | [0, 1] | {_bar(summary.get('retrieval_effectiveness_avg', 0))} |",
-        "",
-        "---",
-        "",
-        "## 📋 Metric Definitions",
-        "",
-        "| Metric | Mô tả | Phương pháp |",
-        "|--------|-------|-------------|",
-        "| **Faithfulness Score** [0,1] | Câu trả lời có bám sát context gốc không? | LLM-as-a-Judge |",
-        "| **Answer Relevance** [1-5] | Câu trả lời có thực sự trả lời câu hỏi không? | LLM-as-a-Judge |",
-        "| **Context Independence** {0,1} | Câu hỏi có tự hiểu được không cần context bổ sung? | LLM-as-a-Judge |",
-        "| **Diversity Score** [0,1] | Độ đa dạng câu hỏi (TTR + bigram + prefix) | Statistical |",
-        "| **Context Coverage** [0,1] | FAQ có phủ đủ chủ đề của tài liệu gốc không? | LLM-as-a-Judge |",
-        "| **Retrieval Effectiveness** [0,1] | Context passage có hỗ trợ chính xác câu trả lời? | LLM-as-a-Judge |",
-        "",
-        "---",
-        "",
-        "## 📈 Distributions",
-        "",
-        "### Answer Relevance Distribution (1–5)",
-        "",
-    ]
-
-    ar_dist = summary.get("answer_relevance_distribution", {})
-    if ar_dist:
-        lines.append("| Score | Count | Fraction | Bar |")
-        lines.append("|-------|-------|----------|-----|")
-        for score_label, val in sorted(ar_dist.items(), key=lambda x: x[0]):
-            frac = val.get("fraction", 0)
-            bar = "█" * round(frac * 20)
-            lines.append(f"| {score_label} | {val.get('count', 0)} | {frac:.1%} | {bar} |")
-        lines.append("")
-
-    lines += [
-        "",
-        "### Faithfulness Distribution",
-        "",
-    ]
-    f_dist = summary.get("faithfulness_distribution", {})
-    if f_dist:
-        lines.append("| Range | Count | Fraction | Bar |")
-        lines.append("|-------|-------|----------|-----|")
-        for label, val in f_dist.items():
-            frac = val.get("fraction", 0)
-            bar = "█" * round(frac * 20)
-            lines.append(f"| {label} | {val.get('count', 0)} | {frac:.1%} | {bar} |")
-        lines.append("")
-
-    lines += [
-        "",
-        "---",
-        "",
-        "## 🗺️ Context Coverage Detail",
-        "",
-        f"**Coverage Score:** `{coverage.get('context_coverage', 0):.3f}`  ",
-        f"**Simple Source Ratio:** `{coverage.get('simple_source_ratio', 0):.3f}`  ",
-        "",
-        f"**Nhận xét:** {coverage.get('coverage_notes', '')}",
-        "",
-    ]
-
-    uncovered = coverage.get("uncovered_topics", [])
-    if uncovered:
-        lines.append("**Chủ đề chưa được phủ:**")
-        lines.append("")
-        for t in uncovered[:20]:
-            lines.append(f"- {t}")
-        lines.append("")
-
-    lines += [
-        "---",
-        "",
-        "## 🔍 Per-Item Evaluation Details",
-        "",
-        "| # | Question (truncated) | Faith. | Relev. | Ctx.Ind. | Retr.Eff. | Notes |",
-        "|---|----------------------|--------|--------|----------|-----------|-------|",
-    ]
-
-    for i, item in enumerate(items, 1):
-        ev = item.get("eval", {})
-        q = item.get("question", "")[:55].replace("|", "/")
-        lines.append(
-            f"| {i} | {q}… | "
-            f"`{ev.get('faithfulness', 0):.2f}` | "
-            f"`{ev.get('answer_relevance', '-')}` | "
-            f"`{ev.get('context_independence', '-')}` | "
-            f"`{ev.get('retrieval_effectiveness', 0):.2f}` | "
-            f"{ev.get('notes', '')[:60]} |"
-        )
-
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-
-    logger.info("Saved: %s", path.name)
 
 
 if __name__ == "__main__":

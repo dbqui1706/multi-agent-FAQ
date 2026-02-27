@@ -3,3 +3,6 @@
 __pycache__/
 *.pyc
 output/
+
+# ignore file test
+test_*.py

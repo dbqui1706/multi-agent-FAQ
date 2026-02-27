@@ -1,14 +1,18 @@
 """
-Agent 2: Extractor
-For each chunk produced by the Chunker, calls the Gemini API to extract:
-- Key regulations and conditions
-- Important numbers/dates/requirements
-- Main topics covered
-
-Adds an `extracted_info` field to every chunk dict.
+Agent 2: Extractor — IMPROVED VERSION
+=======================================
+Cải tiến so với bản gốc:
+  [IMP-1] Output có cấu trúc JSON rõ ràng thay vì plain text
+          → Agent 3 (FAQ Generator) có thể dùng đúng từng trường
+  [IMP-2] Trích xuất riêng: key_rules, numbers_deadlines,
+          subjects, edge_cases, suggested_questions
+  [IMP-3] suggested_questions giúp Agent 3 không bỏ sót edge case
+  [IMP-4] Fallback an toàn khi JSON parse thất bại
 """
 
+import json
 import logging
+import re
 import time
 from typing import Any
 
@@ -16,16 +20,24 @@ from google import genai
 
 logger = logging.getLogger(__name__)
 
+
+# [IMP-1] Prompt yêu cầu output JSON có cấu trúc
 _SYSTEM_PROMPT = """Bạn là chuyên gia phân tích văn bản pháp lý giáo dục Việt Nam.
-Nhiệm vụ: Đọc đoạn văn bản từ Quy Chế Đào Tạo Trình Độ Thạc Sĩ và trích xuất các thông tin QUAN TRỌNG nhất.
+Nhiệm vụ: Đọc đoạn văn từ Quy Chế Đào Tạo Trình Độ Thạc Sĩ và trích xuất thông tin.
 
-Trả về dưới dạng văn bản thuần (không dùng markdown header), bao gồm:
-1. Các quy định chính
-2. Điều kiện, yêu cầu cụ thể (số liệu, thời hạn, tỷ lệ...)
-3. Đối tượng áp dụng
-4. Các điểm đặc biệt cần chú ý
+Trả về JSON hợp lệ với cấu trúc sau (không có markdown):
+{
+  "key_rules": ["Quy định chính 1", "Quy định chính 2"],
+  "numbers_deadlines": ["15 ngày trước khi...", "tối đa 30 tín chỉ...", "5,5 điểm..."],
+  "subjects": ["đối tượng áp dụng 1", "đối tượng áp dụng 2"],
+  "edge_cases": ["trường hợp đặc biệt 1", "ngoại lệ 2"],
+  "suggested_questions": [
+    "Câu hỏi thiết thực mà sinh viên/GV có thể hỏi về đoạn này 1",
+    "Câu hỏi thiết thực 2"
+  ]
+}
 
-Hãy ngắn gọn, súc tích, giữ nguyên thuật ngữ chuyên ngành."""
+Giữ nguyên thuật ngữ chuyên ngành. Ngắn gọn, súc tích."""
 
 
 def run(
@@ -34,15 +46,10 @@ def run(
     model_name: str,
 ) -> list[dict[str, Any]]:
     """
-    Enrich each chunk with extracted key information.
-
-    Args:
-        chunks:     List of chunk dicts from Agent 1 (Chunker).
-        client:     Configured google.genai Client instance.
-        model_name: Gemini model name string.
+    Enrich each chunk with structured extracted information.
 
     Returns:
-        Same list of chunks, each with an added `extracted_info` field.
+        Same list with added `extracted_info` field (dict, not plain text).
     """
     logger.info("[Extractor] Processing %d chunks...", len(chunks))
     enriched: list[dict[str, Any]] = []
@@ -50,46 +57,83 @@ def run(
     for i, chunk in enumerate(chunks, 1):
         content = chunk.get("content", "").strip()
 
-        # Skip very short / empty chunks
         if len(content) < 50:
             chunk = dict(chunk)
-            chunk["extracted_info"] = "(Nội dung quá ngắn, bỏ qua)"
+            chunk["extracted_info"] = {
+                "key_rules": [],
+                "numbers_deadlines": [],
+                "subjects": [],
+                "edge_cases": [],
+                "suggested_questions": [],
+                "_skip": True,
+            }
             enriched.append(chunk)
             logger.debug("[Extractor] Chunk %s skipped (too short)", chunk["id"])
             continue
 
+        term    = chunk.get("term") or chunk.get("chapter") or "N/A"
+        chapter = chunk.get("chapter") or "N/A"
+
         logger.info(
             "[Extractor] [%d/%d] Extracting: %s",
-            i,
-            len(chunks),
-            chunk["term"],
+            i, len(chunks), term,
         )
 
-        prompt = f"""{_SYSTEM_PROMPT}
+        prompt = f"""Nguồn: {chapter} — {term}
 
----
-ĐOẠN VĂN BẢN ({chunk['chapter']} - {chunk['term']}):
+Nội dung:
 {content}
----
 
-Trích xuất thông tin quan trọng:"""
+Trích xuất thông tin (JSON):"""
 
         try:
-            response = client.models.generate_content(
+            response  = client.models.generate_content(
                 model=model_name,
-                contents=prompt,
+                contents=f"{_SYSTEM_PROMPT}\n\n{prompt}",
             )
-            extracted = response.text.strip()
+            raw       = response.text.strip()
+            extracted = _parse_json(raw)
         except Exception as exc:
             logger.warning("[Extractor] Error on chunk %s: %s", chunk["id"], exc)
-            extracted = f"(Lỗi khi trích xuất: {exc})"
+            extracted = _empty_extraction(error=str(exc))
 
         chunk = dict(chunk)
         chunk["extracted_info"] = extracted
         enriched.append(chunk)
 
-        # Avoid hitting rate limits
         time.sleep(0.5)
 
     logger.info("[Extractor] Done. %d chunks enriched.", len(enriched))
     return enriched
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _parse_json(raw: str) -> dict:
+    """[IMP-4] Parse JSON với fallback an toàn."""
+    cleaned = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
+    start   = cleaned.find("{")
+    end     = cleaned.rfind("}")
+    if start == -1 or end == -1:
+        return _empty_extraction(error="No JSON object found")
+    try:
+        data = json.loads(cleaned[start : end + 1])
+        # Đảm bảo tất cả key bắt buộc tồn tại
+        for key in ("key_rules", "numbers_deadlines", "subjects",
+                    "edge_cases", "suggested_questions"):
+            if key not in data:
+                data[key] = []
+        return data
+    except json.JSONDecodeError as exc:
+        return _empty_extraction(error=str(exc))
+
+
+def _empty_extraction(error: str = "") -> dict:
+    return {
+        "key_rules": [],
+        "numbers_deadlines": [],
+        "subjects": [],
+        "edge_cases": [],
+        "suggested_questions": [],
+        "_error": error,
+    }
