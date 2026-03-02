@@ -1,25 +1,3 @@
-"""
-Agent: FAQ Evaluator
-====================
-Đánh giá chất lượng bộ FAQ theo 6 metrics:
-
-Per-item  (LLM — Gemini):
-  faithfulness         [0.0, 1.0]  Câu trả lời có trung thực với context gốc?
-  answer_relevance     [1, 5]      Câu trả lời có thực sự trả lời câu hỏi?
-  context_independence {0, 1}      Câu hỏi có tự thân (không cần tài liệu)?
-
-Corpus-level  (local, không cần LLM):
-  diversity_score          [0.0, 1.0]  Độ đa dạng ngữ nghĩa toàn bộ câu hỏi
-  context_coverage         [0.0, 1.0]  % chunks gốc có FAQ được sinh ra
-  retrieval_effectiveness  [0.0, 1.0]  % FAQ tìm lại được context trong chunks
-
-Output schema:
-  {
-    "summary": { ...averages... },
-    "per_item": [ { "id", "faithfulness", "answer_relevance", "context_independence" } ]
-  }
-"""
-
 from __future__ import annotations
 
 import json
@@ -133,7 +111,7 @@ def run(
             time.sleep(llm_call_delay)
 
     # ── B. Corpus-level metrics (local) ───────────────────────────────────────
-    diversity   = _compute_diversity(faqs)
+    diversity   = _compute_diversity_sematic(faqs)
     coverage    = _compute_context_coverage(faqs, chunks)
     retrieval   = _compute_retrieval_effectiveness(faqs, chunks)
 

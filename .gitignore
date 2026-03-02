@@ -6,3 +6,10 @@ output/
 
 # ignore file test
 test_*.py
+
+# ignore folder output-graph, logs, tmp
+output-graph/
+logs/
+tmp/
+.vscode/
+draft/

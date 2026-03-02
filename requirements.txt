@@ -1,4 +1,9 @@
-google-genai>=1.0.0
-llama-index>=0.10.0
-llama-index-readers-file>=0.1.0
-python-dotenv>=1.0.0
+google-genai
+llama-index
+llama-index-readers-file
+python-dotenv
+langgraph
+langchain-google-genai
+sentence-transformers
+scikit-learn
+ipython

@@ -1,16 +1,3 @@
-"""
-Agent 4: Reviewer — FIXED + IMPROVED VERSION
-==============================================
-Fix so với bản gốc:
-  [FIX-1] Error fallback không còn approved=True với score=5
-  [FIX-2] Đánh giá theo 5 tiêu chí riêng biệt, không chỉ 1 điểm tổng
-  [FIX-3] Tiêu chí Context Independence là check riêng {0,1}
-          không bị "average out" bởi tiêu chí khác
-  [FIX-4] Threshold thích nghi: câu hỏi context-dependent tự động bị reject
-  [IMP-1] Reviewer trả về gợi ý sửa (improvement_hint) cho câu hỏi bị reject
-  [IMP-2] Thống kê rejection reason để pipeline có thể phân tích
-"""
-
 import logging
 import json
 import re
@@ -92,49 +79,27 @@ def run(
         review_breakdown, improvement_hint, is_approved.
     """
     logger.info("[Reviewer] Reviewing %d FAQ items...", len(faq_items))
-    reviewed:          list[dict[str, Any]] = []
-    approved_count                          = 0
-    rejection_reasons: dict[str, int]       = {}
+    reviewed: list[dict[str, Any]] = []
+
+    approved_count = 0
+    retry_count = 0
+    reject_count = 0
 
     for i, item in enumerate(faq_items, 1):
-        logger.info(
-            "[Reviewer] [%d/%d] %s",
-            i, len(faq_items),
-            item.get("question", "")[:70],
-        )
+        logger.info("[Reviewer] [%d/%d] %s", i, len(faq_items), item.get("question", "")[:70])
 
-        prompt = _build_review_prompt(item)
+        prompt = _build_prompt(item)
 
         try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-            )
-            raw    = response.text.strip()
-            review = _parse_review_json(raw)
+            response = client.models.generate_content(model=model_name, contents=prompt)
+            review = _parse_review_json(response.text.strip())
         except Exception as exc:
             logger.warning("[Reviewer] Error on item %s: %s", item["id"], exc)
-            # [FIX-1] Reject khi lỗi, không approve mù quáng
             review = _error_fallback(str(exc))
 
         weighted_score = _compute_weighted_score(review.get("scores", {}))
-
-        # [FIX-3] Context Independence là điều kiện cứng
         ctx_ok   = review.get("context_independence_ok", True)
-        approved = (
-            weighted_score >= _APPROVAL_THRESHOLD
-            and (ctx_ok or not _CONTEXT_INDEP_REQUIRED)
-        )
-
-        if not approved:
-            if not ctx_ok:
-                rejection_reasons["context_dependent"] = (
-                    rejection_reasons.get("context_dependent", 0) + 1
-                )
-            if weighted_score < _APPROVAL_THRESHOLD:
-                rejection_reasons["low_score"] = (
-                    rejection_reasons.get("low_score", 0) + 1
-                )
+        approved = (weighted_score >= _APPROVAL_THRESHOLD and (ctx_ok or not _CONTEXT_INDEP_REQUIRED))
 
         item = dict(item)
         item["review_score"]     = round(weighted_score, 2)
@@ -146,26 +111,25 @@ def run(
         reviewed.append(item)
         if approved:
             approved_count += 1
+        elif review.get("is_retry"):
+            reject_count += 1
+        else:
+            retry_count += 1 # first fail
 
         time.sleep(0.5)
 
-    if rejection_reasons:
-        logger.info("[Reviewer] Rejection breakdown: %s", rejection_reasons)
-
-    approved_items = [r for r in reviewed if r["is_approved"]]
     logger.info(
-        "[Reviewer] %d/%d approved (%.0f%%).",
-        approved_count, len(faq_items),
-        (approved_count / len(faq_items) * 100) if faq_items else 0,
+       "[Reviewer] approved=%d  retry=%d  reject=%d / %d total",
+        approved_count, retry_count, reject_count, len(faq_items)
     )
-    return approved_items
+    return reviewed
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _build_review_prompt(item: dict) -> str:
+def _build_prompt(item: dict) -> str:
     return f"""{_SYSTEM_PROMPT}
 
 ---
@@ -176,11 +140,11 @@ CÂU HỎI: {item.get('question', '')}
 
 CÂU TRẢ LỜI: {item.get('answer', '')}
 
-CONTEXT GỐC (nguyên văn tài liệu):
+CONTEXT GỐC:
 {item.get('context', '')}
 ---
 
-Kết quả review (chỉ JSON):"""
+JSON:"""
 
 
 def _compute_weighted_score(scores: dict) -> float:

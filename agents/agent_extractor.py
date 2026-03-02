@@ -1,15 +1,3 @@
-"""
-Agent 2: Extractor — IMPROVED VERSION
-=======================================
-Cải tiến so với bản gốc:
-  [IMP-1] Output có cấu trúc JSON rõ ràng thay vì plain text
-          → Agent 3 (FAQ Generator) có thể dùng đúng từng trường
-  [IMP-2] Trích xuất riêng: key_rules, numbers_deadlines,
-          subjects, edge_cases, suggested_questions
-  [IMP-3] suggested_questions giúp Agent 3 không bỏ sót edge case
-  [IMP-4] Fallback an toàn khi JSON parse thất bại
-"""
-
 import json
 import logging
 import re
@@ -20,8 +8,19 @@ from google import genai
 
 logger = logging.getLogger(__name__)
 
+# "cross_references": [
+#     "điểm X khoản Y Điều Z của Quy chế này",
+#     "điểm A, B khoản C Điều D của Quy chế này",
+#     "khoản X, Điều Y của Quy chế này",
+#     ...
+#   ],
+#   "self_references": [
+#     "điểm a, b khoản 1 Điều này",
+#     "tại khoản X và khoản Y Điều này",
+#     ...
+#   ]
 
-# [IMP-1] Prompt yêu cầu output JSON có cấu trúc
+# Prompt 
 _SYSTEM_PROMPT = """Bạn là chuyên gia phân tích văn bản pháp lý giáo dục Việt Nam.
 Nhiệm vụ: Đọc đoạn văn từ Quy Chế Đào Tạo Trình Độ Thạc Sĩ và trích xuất thông tin.
 
